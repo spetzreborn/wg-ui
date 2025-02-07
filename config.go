@@ -28,13 +28,22 @@ type UserConfig struct {
 
 // ClientConfig represents a single client for a user
 type ClientConfig struct {
-	Name       string
-	PrivateKey string
-	PublicKey  string
-	IP         net.IP
-	Notes      string
-	Created    string
-	Modified   string
+	Name         string
+	PrivateKey   string
+	PublicKey    string
+	PresharedKey string
+	IP           net.IP
+	AllowedIPs   []*net.IPNet
+	MTU          int
+	Notes        string
+	Created      string
+	Modified     string
+}
+
+// NewClient provides fields that should not be saved however is neccesary on creation of a new client
+type NewClient struct {
+	ClientConfig
+	GeneratePSK bool
 }
 
 // NewServerConfig creates and returns a reference to a new ServerConfig
@@ -66,6 +75,31 @@ func NewServerConfig(cfgPath string) *ServerConfig {
 		log.Fatal(err)
 	}
 
+	configWriteRequired := false
+
+	// Set default MTU if MTU is not set (migration from old config)
+	migrationMTU := *wgPeerMtu
+	if err := verifyLinkMTU(migrationMTU); err != nil {
+		log.WithError(err).Warnf("Invalid peer MTU, migration MTU is set to %d", wgDefaultMtu)
+		migrationMTU = wgDefaultMtu
+	}
+
+	for _, user := range cfg.Users {
+		for _, client := range user.Clients {
+			if client.MTU == 0 {
+				client.MTU = migrationMTU
+				configWriteRequired = true
+			}
+		}
+	}
+
+	if configWriteRequired {
+		err = cfg.Write()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	return cfg
 }
 
@@ -93,20 +127,31 @@ func (cfg *ServerConfig) GetUserConfig(user string) *UserConfig {
 }
 
 // NewClientConfig initiates a new client, returning a reference to the new config
-func NewClientConfig(ip net.IP, Name, Notes string) *ClientConfig {
+func NewClientConfig(Name string, ip net.IP, mtu int, Notes string, generatePSK bool) *ClientConfig {
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	psk := ""
+	if generatePSK {
+		pskey, err := wgtypes.GenerateKey()
+		if err != nil {
+			log.Fatal(err)
+		}
+		psk = pskey.String()
+	}
+
 	cfg := ClientConfig{
-		Name:       Name,
-		PrivateKey: key.String(),
-		PublicKey:  key.PublicKey().String(),
-		IP:         ip,
-		Notes:      Notes,
-		Created:    time.Now().Format(time.RFC3339),
-		Modified:   time.Now().Format(time.RFC3339),
+		Name:         Name,
+		PrivateKey:   key.String(),
+		PublicKey:    key.PublicKey().String(),
+		IP:           ip,
+		MTU:          mtu,
+		PresharedKey: psk,
+		Notes:        Notes,
+		Created:      time.Now().Format(time.RFC3339),
+		Modified:     time.Now().Format(time.RFC3339),
 	}
 
 	return &cfg

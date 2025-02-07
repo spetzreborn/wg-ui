@@ -1,57 +1,61 @@
-name: Go
-on: 
+name: PR
+on:
   push:
-    branches-ignore: master
+    branches-ignore: main
   pull_request:
     branches:
-      - master
+      - main
+
 jobs:
   review:
-    name: Review code
+    name: Code Review
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@master
-    - name: bindfs
-      uses: "cedrickring/golang-action@1.4.1"
+    - uses: actions/checkout@v2
+    - uses: actions/setup-node@v2
       with:
-        args: go get -u github.com/go-bindata/go-bindata/... && go get -u github.com/elazarl/go-bindata-assetfs/... && go-bindata-assetfs -prefix ui/dist ui/dist
+        node-version: '14'
+    - uses: actions/setup-go@v2
+      with:
+        go-version: '1.17'
+
+    - name: npm install and build
+      run: |
+        npm install --prefix ui
+        npm run --prefix ui build
+
     - name: Check styling error
-      uses: "cedrickring/golang-action@1.4.1"
-      with:
-        args: go get -u golang.org/x/lint/golint; golint -set_exit_status main.go server.go config.go # ./... update to use package when https://github.com/go-bindata/go-bindata/pull/37 is merged
+      run: go install golang.org/x/lint/golint@latest; golint -set_exit_status main.go server.go config.go
+
     - name: Check missing error check
-      uses: "cedrickring/golang-action@1.4.1"
-      with:
-        args: go get -u github.com/kisielk/errcheck; errcheck ./...
+      run: go install github.com/kisielk/errcheck@latest; errcheck ./...
+
     - name: Check suspicious constructs (1)
-      uses: "cedrickring/golang-action@1.4.1"
-      with:
-        args: go get honnef.co/go/tools/cmd/staticcheck; staticcheck -checks all,-ST1003,-U1000,-ST1005 ./... # have to disable ST1003,U1000,ST1005 due to the generated code
+      run: go install honnef.co/go/tools/cmd/staticcheck@latest; staticcheck -checks all,-ST1003,-U1000,-ST1005,-SA9002 ./... # have to disable ST1003,U1000,ST1005 due to the generated code
+
     - name: Check suspicious constructs (2)
-      uses: "cedrickring/golang-action@1.4.1"
-      with:
-        args: go vet ./...
+      run: go vet ./...
+
     - name: Check security issues with gosec
-      uses: "cedrickring/golang-action@1.4.1"
-      with:
-        # TODO: remove `-exclude=G110` once https://github.com/go-bindata/go-bindata/pull/50 is merged and released
-        args: go get github.com/securego/gosec/cmd/gosec; gosec -exclude=G110 ./... # https://github.com/securego/gosec
+      run: go install github.com/securego/gosec/cmd/gosec@latest; gosec ./... # https://github.com/securego/gosec
+
   build:
+    name: Build wg-ui
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@master
-    - name: free disk space
-      run: |
-        sudo swapoff -a
-        sudo rm -f /swapfile
-        sudo apt clean
-        docker rmi $(docker image ls -aq)
-        df -h
-    - name: Install buildah
-      run: |
-        sudo apt-get install -qq -y software-properties-common
-        sudo add-apt-repository -y ppa:projectatomic/ppa
-        sudo apt-get update -qq
-        sudo apt-get -qq -y install buildah
-    - name: Build the Docker image
-      run: buildah bud --format=docker --layers -f Dockerfile .
+    - uses: actions/checkout@v2
+    - uses: actions/setup-node@v2
+      with:
+        node-version: '14'
+    - uses: actions/setup-go@v2
+      with:
+        go-version: '1.17'
+
+    - name: Build binary
+      run: make build
+
+    - name: Check binary
+      run: file bin/wireguard-ui
+
+    - name: Cleanup
+      run: rm -rf bin/

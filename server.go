@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -17,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	assetfs "github.com/elazarl/go-bindata-assetfs"
+	validator "github.com/fujiwara/go-amzn-oidc/validator"
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"github.com/julienschmidt/httprouter"
@@ -25,9 +27,14 @@ import (
 	"github.com/skip2/go-qrcode"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/crypto/bcrypt"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"gopkg.in/alecthomas/kingpin.v2"
+)
+
+const (
+	wgDefaultMtu = 1420
 )
 
 var (
@@ -38,6 +45,8 @@ var (
 	natLink               = kingpin.Flag("nat-device", "Network interface to masquerade").Default("wlp2s0").String()
 	clientIPRange         = kingpin.Flag("client-ip-range", "Client IP CIDR").Default("172.31.255.0/24").String()
 	authUserHeader        = kingpin.Flag("auth-user-header", "Header containing username").Default("X-Forwarded-User").String()
+	authBasicUser         = kingpin.Flag("auth-basic-user", "Basic auth static username").Default("").String()
+	authBasicPass         = kingpin.Flag("auth-basic-pass", "Basic auth static password").Default("").String()
 	maxNumberClientConfig = kingpin.Flag("max-number-client-config", "Max number of configs an client can use. 0 is unlimited").Default("0").Int()
 
 	wgLinkName   = kingpin.Flag("wg-device-name", "WireGuard network device name").Default("wg0").String()
@@ -45,6 +54,9 @@ var (
 	wgEndpoint   = kingpin.Flag("wg-endpoint", "WireGuard endpoint address").Default("127.0.0.1:51820").String()
 	wgAllowedIPs = kingpin.Flag("wg-allowed-ips", "WireGuard client allowed ips").Default("0.0.0.0/0").Strings()
 	wgDNS        = kingpin.Flag("wg-dns", "WireGuard client DNS server (optional)").Default("").String()
+	wgKeepAlive  = kingpin.Flag("wg-keepalive", "WireGuard Keepalive for peers, defined in seconds (optional)").Default("").String()
+	wgServerMtu  = kingpin.Flag("wg-server-mtu", "WireGuard server MTU").Default("1420").Int()
+	wgPeerMtu    = kingpin.Flag("wg-peer-mtu", "WireGuard default peer MTU").Default(strconv.Itoa(wgDefaultMtu)).Int()
 
 	devUIServer = kingpin.Flag("dev-ui-server", "Developer mode: If specified, proxy all static assets to this endpoint").String()
 
@@ -83,6 +95,9 @@ func ifname(n string) []byte {
 	return b
 }
 
+//go:embed ui/dist
+var assetsFS embed.FS
+
 // NewServer returns an instance of Server which contains both the webserver and the reference to Wireguard
 func NewServer() *Server {
 	ipAddr, ipNet, err := net.ParseCIDR(*clientIPRange)
@@ -100,7 +115,16 @@ func NewServer() *Server {
 	config := NewServerConfig(cfgPath)
 
 	log.Debug("Configuration loaded with public key: ", config.PublicKey)
-	assets := http.FileServer(&assetfs.AssetFS{Asset: Asset, AssetDir: AssetDir, AssetInfo: AssetInfo, Prefix: ""})
+
+	var fsys fs.FS = assetsFS
+	if f, err := fs.Sub(fsys, "ui/dist"); err != nil {
+		log.Error(fmt.Errorf("ui/dist does not exist in fs :%w", err))
+	} else {
+		fsys = f
+	}
+	fmt.Println(fs.Glob(fsys, "*"))
+
+	assets := http.FileServer(http.FS(fsys))
 
 	s := Server{
 		serverConfigPath: cfgPath,
@@ -152,6 +176,13 @@ func (s *Server) initInterface() error {
 	if os.IsExist(err) {
 		log.Infof("WireGuard interface %s already has the requested address: ", s.clientIPRange)
 	} else if err != nil {
+		return err
+	}
+
+	log.Debug("Setting link MTU: ", *wgServerMtu)
+	err = netlink.LinkSetMTU(&link, *wgServerMtu)
+	if err != nil {
+		log.Error("Error setting link MTU: ", *wgLinkName)
 		return err
 	}
 
@@ -273,6 +304,14 @@ func (s *Server) configureWireGuard() error {
 		return err
 	}
 
+	log.Debugf("Getting current Wireguard config")
+	currentdev, err := wg.Device(*wgLinkName)
+	if err != nil {
+		return err
+	}
+	currentpeers := currentdev.Peers
+	diffpeers := make([]wgtypes.PeerConfig, 0)
+
 	peers := make([]wgtypes.PeerConfig, 0)
 	for user, cfg := range s.Config.Users {
 		for id, dev := range cfg.Clients {
@@ -281,12 +320,18 @@ func (s *Server) configureWireGuard() error {
 				return err
 			}
 
-			allowedIPs := make([]net.IPNet, 1)
+			psk, _ := wgtypes.ParseKey(dev.PresharedKey)
+			allowedIPs := make([]net.IPNet, 1+len(dev.AllowedIPs))
 			allowedIPs[0] = *netlink.NewIPNet(dev.IP)
+
+			for i, cidr := range dev.AllowedIPs {
+				allowedIPs[1+i] = *cidr
+			}
 			peer := wgtypes.PeerConfig{
 				PublicKey:         pubKey,
 				ReplaceAllowedIPs: true,
 				AllowedIPs:        allowedIPs,
+				PresharedKey:      &psk,
 			}
 
 			log.WithFields(log.Fields{"user": user, "client": id, "key": dev.PublicKey, "allowedIPs": peer.AllowedIPs}).Debug("Adding wireguard peer")
@@ -295,17 +340,58 @@ func (s *Server) configureWireGuard() error {
 		}
 	}
 
+	// Determine peers updated and to be removed from WireGuard
+	for _, i := range currentpeers {
+		found := false
+		for _, j := range peers {
+			if i.PublicKey == j.PublicKey {
+				found = true
+				j.UpdateOnly = true
+				diffpeers = append(diffpeers, j)
+				break
+			}
+		}
+		if !found {
+			peertoremove := wgtypes.PeerConfig{
+				PublicKey: i.PublicKey,
+				Remove:    true,
+			}
+			diffpeers = append(diffpeers, peertoremove)
+		}
+	}
+
+	// Determine peers to be added to WireGuard
+	for _, i := range peers {
+		found := false
+		for _, j := range currentpeers {
+			if i.PublicKey == j.PublicKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			diffpeers = append(diffpeers, i)
+		}
+	}
+
 	cfg := wgtypes.Config{
 		PrivateKey:   &key,
 		ListenPort:   wgListenPort,
-		ReplacePeers: true,
-		Peers:        peers,
+		ReplacePeers: false,
+		Peers:        diffpeers,
 	}
 	err = wg.ConfigureDevice(*wgLinkName, cfg)
 	if err != nil {
 		return err
 	}
 
+	return nil
+}
+
+func verifyLinkMTU(mtu int) error {
+	if mtu < 1280 || mtu > 1500 {
+		return fmt.Errorf("MTU must be between 1280 and 1500")
+	}
 	return nil
 }
 
@@ -358,7 +444,25 @@ func (s *Server) Start() error {
 
 	log.WithField("listenAddr", *listenAddr).Info("Starting server")
 
-	return http.ListenAndServe(*listenAddr, s.userFromHeader(router))
+	return http.ListenAndServe(*listenAddr, s.basicAuth(s.userFromHeader(router)))
+}
+
+func (s *Server) basicAuth(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		// If we specified a user, require auth
+		if *authBasicUser != "" {
+			u, p, ok := r.BasicAuth()
+			if !ok || u != *authBasicUser || bcrypt.CompareHashAndPassword([]byte(*authBasicPass), []byte(p)) != nil {
+				w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		handler.ServeHTTP(w, r)
+
+	})
 }
 
 func (s *Server) userFromHeader(handler http.Handler) http.Handler {
@@ -371,6 +475,17 @@ func (s *Server) userFromHeader(handler http.Handler) http.Handler {
 
 		if *authUserHeader == "X-Goog-Authenticated-User-Email" {
 			user = strings.TrimPrefix(user, "accounts.google.com:")
+		}
+
+		// AWS ALB-specific JWT header (https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html)
+		if *authUserHeader == "x-amzn-oidc-data" {
+			claims, err := validator.Validate(user)
+			if err != nil {
+				log.Debug("Unauthenticated request")
+				user = "anonymous"
+			} else {
+				user = claims.Email()
+			}
 		}
 
 		cookie := http.Cookie{
@@ -419,6 +534,8 @@ func (s *Server) WhoAmI(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 
 // GetClients returns a list of all clients for the current user
 func (s *Server) GetClients(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 	user := r.Context().Value(key).(string)
 	log.Debug(user)
 	clients := map[string]*ClientConfig{}
@@ -443,6 +560,8 @@ func (s *Server) Index(w http.ResponseWriter, r *http.Request, _ httprouter.Para
 
 // GetClient returns a specific client for the current user
 func (s *Server) GetClient(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 	user := r.Context().Value(key).(string)
 	usercfg := s.Config.Users[user]
 	if usercfg == nil {
@@ -456,27 +575,37 @@ func (s *Server) GetClient(w http.ResponseWriter, r *http.Request, ps httprouter
 		return
 	}
 
-	allowedIPs := strings.Join(*wgAllowedIPs, ",")
-
-	dns := ""
+	interfaceConfig := []string{
+		"[Interface]",
+		"Address = " + client.IP.String(),
+		"PrivateKey = " + client.PrivateKey,
+	}
 	if *wgDNS != "" {
-		dns = fmt.Sprint("DNS = ", *wgDNS)
+		interfaceConfig = append(interfaceConfig, "DNS = "+*wgDNS)
+	}
+	if client.MTU != wgDefaultMtu {
+		interfaceConfig = append(interfaceConfig, fmt.Sprintf("MTU = %d", client.MTU))
 	}
 
-	configData := fmt.Sprintf(`[Interface]
-%s
-Address = %s
-PrivateKey = %s
-[Peer]
-PublicKey = %s
-AllowedIPs = %s
-Endpoint = %s
-`, dns, client.IP.String(), client.PrivateKey, s.Config.PublicKey, allowedIPs, *wgEndpoint)
+	peerConfig := []string{
+		"[Peer]",
+		"PublicKey = " + s.Config.PublicKey,
+		"AllowedIPs = " + strings.Join(*wgAllowedIPs, ","),
+		"Endpoint = " + *wgEndpoint,
+	}
+	if *wgKeepAlive != "" {
+		peerConfig = append(peerConfig, "PersistentKeepalive = "+*wgKeepAlive)
+	}
+	if client.PresharedKey != "" {
+		peerConfig = append(peerConfig, "PresharedKey = "+client.PresharedKey)
+	}
+
+	clientConfig := strings.Join(interfaceConfig[:], "\n") + "\n\n" + strings.Join(peerConfig[:], "\n") + "\n"
 
 	format := r.URL.Query().Get("format")
 
 	if format == "qrcode" {
-		png, err := qrcode.Encode(configData, qrcode.Medium, 220)
+		png, err := qrcode.Encode(clientConfig, qrcode.Medium, 220)
 		if err != nil {
 			log.Error(err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -499,7 +628,7 @@ Endpoint = %s
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 		w.Header().Set("Content-Type", "application/config")
 		w.WriteHeader(http.StatusOK)
-		_, err := fmt.Fprint(w, configData)
+		_, err := fmt.Fprint(w, clientConfig)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
@@ -516,6 +645,8 @@ Endpoint = %s
 
 // EditClient edits the specific client passed by the current user
 func (s *Server) EditClient(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	user := r.Context().Value(key).(string)
 	usercfg := s.Config.Users[user]
 	if usercfg == nil {
@@ -547,8 +678,17 @@ func (s *Server) EditClient(w http.ResponseWriter, r *http.Request, ps httproute
 		client.Notes = cfg.Notes
 	}
 
+	if err := verifyLinkMTU(cfg.MTU); err == nil {
+		client.MTU = cfg.MTU
+	}
+
+	client.PresharedKey = cfg.PresharedKey
+
 	client.Modified = time.Now().Format(time.RFC3339)
 
+	if len(cfg.AllowedIPs) != 0 {
+		client.AllowedIPs = cfg.AllowedIPs
+	}
 	s.reconfigure()
 
 	w.WriteHeader(http.StatusOK)
@@ -561,6 +701,8 @@ func (s *Server) EditClient(w http.ResponseWriter, r *http.Request, ps httproute
 
 // DeleteClient deletes the specified client for the current user
 func (s *Server) DeleteClient(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	user := r.Context().Value(key).(string)
 	usercfg := s.Config.Users[user]
 	if usercfg == nil {
@@ -615,17 +757,27 @@ func (s *Server) CreateClient(w http.ResponseWriter, r *http.Request, ps httprou
 	}
 
 	decoder := json.NewDecoder(r.Body)
-	client := &ClientConfig{}
-	err := decoder.Decode(&client)
+	newclient := &NewClient{}
+	err := decoder.Decode(&newclient)
 	if err != nil {
 		log.Warn("Error parsing request: ", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	if client.Name == "" {
+	if newclient.Name == "" {
 		log.Debugf("No clientName:using default: \"Unnamed Client\"")
-		client.Name = "Unnamed Client"
+		newclient.Name = "Unnamed Client"
+	}
+
+	if err := verifyLinkMTU(newclient.MTU); err != nil {
+		log.Debugf("Invalid new client MTU: %d", newclient.MTU)
+		if err := verifyLinkMTU(*wgPeerMtu); err != nil {
+			log.Debugf("Invalid peer MTU: %d", *wgPeerMtu)
+			newclient.MTU = wgDefaultMtu
+		} else {
+			newclient.MTU = *wgPeerMtu
+		}
 	}
 
 	i := 0
@@ -643,7 +795,7 @@ func (s *Server) CreateClient(w http.ResponseWriter, r *http.Request, ps httprou
 	i = i + 1
 
 	ip := s.allocateIP()
-	client = NewClientConfig(ip, client.Name, client.Notes)
+	client := NewClientConfig(newclient.Name, ip, newclient.MTU, newclient.Notes, newclient.GeneratePSK)
 	c.Clients[strconv.Itoa(i)] = client
 
 	s.reconfigure()

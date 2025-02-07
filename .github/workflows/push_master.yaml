@@ -1,30 +1,96 @@
-name: Docker Image CI
+name: Main
+
 on:
   push:
     branches:
-      - master
+      - main
+
 jobs:
-  build:
+  docker-build:
+    name: Docker Main
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
-    - name: Install buildah
-      run: |
-        sudo apt-get install -qq -y software-properties-common
-        sudo add-apt-repository -y ppa:projectatomic/ppa
-        sudo apt-get update -qq
-        sudo apt-get -qq -y install buildah
-    - name: free disk space
-      run: |
-        sudo swapoff -a
-        sudo rm -f /swapfile
-        sudo apt clean
-        docker rmi $(docker image ls -aq)
-        df -h
-    - name: Build & push the Docker image
-      env:
-        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-      run: |
-        buildah bud --format=docker --layers -t embarkstudios/wireguard-ui:latest -t embarkstudios/wireguard-ui:$GITHUB_SHA -f Dockerfile .
-        buildah push --creds $DOCKER_USERNAME:$DOCKER_PASSWORD --format=v2s2 embarkstudios/wireguard-ui
+      - uses: actions/checkout@v2
+      - uses: docker/setup-qemu-action@v1
+      - uses: docker/setup-buildx-action@v1
+      - uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - uses: actions/cache@v2
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: embarkstudios/wireguard-ui:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+
+  docker-userspace:
+    name: Docker UserSpace
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+      - uses: actions/checkout@v2
+      - uses: docker/setup-qemu-action@v1
+      - uses: docker/setup-buildx-action@v1
+      - uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - uses: actions/cache@v2
+        with:
+          path: /tmp/.buildx-cache-userspace
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./UserSpace.Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: embarkstudios/wireguard-ui:userspace
+          cache-from: type=local,src=/tmp/.buildx-cache-userspace
+          cache-to: type=local,dest=/tmp/.buildx-cache-userspace
+
+  docker-debug:
+    name: Docker Debug
+    runs-on: ubuntu-latest
+    needs: [docker-build, docker-userspace]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: docker/setup-qemu-action@v1
+      - uses: docker/setup-buildx-action@v1
+      - uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - uses: actions/cache@v2
+        with:
+          path: /tmp/.buildx-cache-debug
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile.debug
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: embarkstudios/wireguard-ui:debug
+          cache-from: type=local,src=/tmp/.buildx-cache-debug
+          cache-to: type=local,dest=/tmp/.buildx-cache-debug
